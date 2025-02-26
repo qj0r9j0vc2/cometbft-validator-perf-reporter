@@ -23,8 +23,8 @@ import (
 )
 
 const (
-	Timeout    = 30
-	TargetHost = "127.0.0.1:26657"
+	Timeout   = 30
+	Localhost = "127.0.0.1:26657"
 )
 
 // NodeStatus wraps whether we successfully connected and the relevant block info.
@@ -57,13 +57,19 @@ func main() {
 	lastHeight := flag.Int64("last", 0, "Block height to check until")
 	validator := flag.String("validator", "", "Target validator consensus address in hex (uppercase)")
 	targetRPC := flag.String("target", "", "target RPC to query")
+	semSize := flag.Int("semaphore", 0, "Semaphore to use to send transactions")
 	logLevel := flag.String("log-level", "info", "log level")
 	flag.Parse()
 	if *validator == "" {
 		log.Fatal("validator flag is required")
 	}
 	if *targetRPC == "" {
-		log.Fatal("target RPC flag is required")
+		host := Localhost
+		targetRPC = &host
+	}
+	if *semSize < 1 {
+		maxWorkers := runtime.GOMAXPROCS(0)
+		semSize = &maxWorkers
 	}
 
 	l, err := log.ParseLevel(*logLevel)
@@ -71,21 +77,16 @@ func main() {
 		l = log.InfoLevel
 	}
 	log.SetLevel(l)
-
-	maxWorkers := runtime.GOMAXPROCS(0)
-	log.Infof("Setting validator: %s, blocksToCheck: %d, semaphore: %d, targetRPC: %s, log level: %s", *validator, *blocksToCheck, maxWorkers, *targetRPC, *logLevel)
+	log.Infof("Setting validator: %s, blocksToCheck: %d, semaphore: %d, targetRPC: %s, log level: %s", *validator, *blocksToCheck, *semSize, *targetRPC, *logLevel)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
 	client := &http.Client{
 		Timeout: Timeout * time.Second,
-		Transport: &http.Transport{
-			MaxIdleConnsPerHost: maxWorkers,
-		},
 	}
 
-	var validHost string = TargetHost
+	var validHost string = *targetRPC
 
 	statusRes, err := client.Get(addPrefix(fmt.Sprintf("%s/status", validHost)))
 	if err != nil {
@@ -117,7 +118,7 @@ func main() {
 	log.Infof("Checking validator signature stats from block %d to %d on host %s", startHeight, latestHeight, validHost)
 
 	rawFile := fmt.Sprintf("%s_%d-%d-blocks.txt", *validator, startHeight, startHeight+int64(*blocksToCheck))
-	res, err := checkValidatorSignatureStats(ctx, rawFile, client, validHost, startHeight, *blocksToCheck, *validator, maxWorkers)
+	res, err := checkValidatorSignatureStats(ctx, rawFile, client, validHost, startHeight, *blocksToCheck, *validator, *semSize)
 	if err != nil {
 		log.Error(err)
 	}
