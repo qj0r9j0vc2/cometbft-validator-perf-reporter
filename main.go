@@ -313,7 +313,7 @@ func checkValidatorSignatureStats(ctx context.Context, filename string, client *
 
 	w := bufio.NewWriter(file)
 	if _, err = w.WriteString(
-		"0: Proposed, 1: Signed, 2: Missed, 3: Unknown\n\n"); err != nil {
+		"-1: Unknown, 1: Missed, 2: Signed, 3: Proposed\n\n"); err != nil {
 		log.Fatalf("Cannot write output file: %v", err)
 	}
 
