@@ -1,14 +1,19 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"flag"
 	"fmt"
+	"github.com/pkg/errors"
+	"golang.org/x/sync/semaphore"
 	"io"
 	"net/http"
 	"os"
 	"os/exec"
+	"runtime"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -19,9 +24,7 @@ import (
 
 const (
 	Timeout    = 30
-	Semaphore  = 100
-	TargetHost = "88.99.211.241:26657"
-	ChainId    = "injective-1"
+	TargetHost = "127.0.0.1:26657"
 )
 
 // NodeStatus wraps whether we successfully connected and the relevant block info.
@@ -43,55 +46,46 @@ type BlockPoint struct {
 type StatusType int
 
 const (
-	Statusmissed StatusType = iota
+	StatusUnknown            = -1
+	StatusMissed  StatusType = iota
 	StatusSigned
 	StatusProposed
-	StatusUnkown
 )
 
 func main() {
 	blocksToCheck := flag.Int("blocks", 10, "Number of blocks to check for validator signatures")
 	lastHeight := flag.Int64("last", 0, "Block height to check until")
 	validator := flag.String("validator", "", "Target validator consensus address in hex (uppercase)")
-	semaphore := flag.Int("semaphore", 0, "Semaphore pool size")
 	targetRPC := flag.String("target", "", "target RPC to query")
+	logLevel := flag.String("log-level", "info", "log level")
 	flag.Parse()
 	if *validator == "" {
 		log.Fatal("validator flag is required")
-	}
-	if *semaphore == 0 {
-		*semaphore = Semaphore
 	}
 	if *targetRPC == "" {
 		log.Fatal("target RPC flag is required")
 	}
 
-	log.SetLevel(log.InfoLevel)
+	l, err := log.ParseLevel(*logLevel)
+	if err != nil {
+		l = log.InfoLevel
+	}
+	log.SetLevel(l)
+
+	maxWorkers := runtime.GOMAXPROCS(0)
+	log.Infof("Setting validator: %s, blocksToCheck: %d, semaphore: %d, targetRPC: %s, log level: %s", *validator, *blocksToCheck, maxWorkers, *targetRPC, *logLevel)
+
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
 	client := &http.Client{
 		Timeout: Timeout * time.Second,
+		Transport: &http.Transport{
+			MaxIdleConnsPerHost: maxWorkers,
+		},
 	}
 
 	var validHost string = TargetHost
-	//for host, status := range rpcMap {
-	//	if status.Open && status.Network == ChainId {
-	//		log.Infof("%40s, moniker=%-40s start: %10s/%24s, latest: %10s/%24s",
-	//			host, status.Moniker,
-	//			status.Earliest.Height, status.Earliest.Time.Format(time.RFC3339),
-	//			status.Latest.Height, status.Latest.Time.Format(time.RFC3339),
-	//		)
-	//		validHost = host // select the first valid host
-	//		break
-	//	} else if status.Open && status.Network != ChainId {
-	//		log.Warningf("Network mismatch for host=%s, got=%s, want=%s",
-	//			host, status.Network, ChainId)
-	//	}
-	//}
-	//if validHost == "" {
-	//	log.Fatal("No valid host found for block query")
-	//}
 
 	statusRes, err := client.Get(addPrefix(fmt.Sprintf("%s/status", validHost)))
 	if err != nil {
@@ -122,10 +116,13 @@ func main() {
 	}
 	log.Infof("Checking validator signature stats from block %d to %d on host %s", startHeight, latestHeight, validHost)
 
-	blockSem := make(chan struct{}, *semaphore)
-	raw, res := checkValidatorSignatureStats(ctx, client, validHost, startHeight, *blocksToCheck, *validator, blockSem)
+	rawFile := fmt.Sprintf("%s_%d-%d-blocks.txt", *validator, startHeight, startHeight+int64(*blocksToCheck))
+	res, err := checkValidatorSignatureStats(ctx, rawFile, client, validHost, startHeight, *blocksToCheck, *validator, maxWorkers)
+	if err != nil {
+		log.Error(err)
+	}
 	log.Infof(res)
-	err = os.WriteFile(fmt.Sprintf("%s_%d-%d.txt", *validator, startHeight, startHeight+int64(*blocksToCheck)), []byte(fmt.Sprintf("%s\n%s", res, raw)), 0644)
+	err = os.WriteFile(fmt.Sprintf("%s_%d-%d.txt", *validator, startHeight, startHeight+int64(*blocksToCheck)), []byte(fmt.Sprintf("%s", res)), 0644)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -162,22 +159,28 @@ func addPrefix(host string) string {
 	return fmt.Sprintf("http://%s", host)
 }
 
-func checkValidatorSignatureStats(ctx context.Context, client *http.Client, host string, startHeight int64, blocksToCheck int, targetValidator string, sem chan struct{}) (string, string) {
-	var wg sync.WaitGroup
-	var mtx sync.Mutex
-	stats := struct {
-		proposed uint64
-		signed   uint64
-		missed   uint64
-		unknown  uint64
-	}{}
-	defer ctx.Done()
+type stat struct {
+	proposed uint64
+	signed   uint64
+	missed   uint64
+	unknown  uint64
+}
 
-	var blocks = map[int64]StatusType{}
+func checkValidatorSignatureStats(ctx context.Context, filename string, client *http.Client, host string, startHeight int64, blocksToCheck int, targetValidator string, semSize int) (string, error) {
+	var (
+		mu     = new(sync.Mutex)
+		stats  = make(map[string]stat)
+		blocks = make(map[int64]map[string]StatusType)
+	)
+
+	sem := semaphore.NewWeighted(int64(semSize))
+
+	// Start progress ticker goroutine
+	ticker := time.NewTicker(1 * time.Second)
+	defer ticker.Stop()
 
 	getSize := func(totalSize int) int {
 		target := 100
-
 		divider := 10
 		for {
 			if totalSize/divider < target {
@@ -188,94 +191,300 @@ func checkValidatorSignatureStats(ctx context.Context, client *http.Client, host
 		}
 	}
 	div := getSize(blocksToCheck)
+
 	go func() {
-		t := time.NewTicker(1 * time.Second)
-
-		for {
-			clearScreen()
-			fmt.Printf(updateGauge(blocksToCheck/div, blocksToCheck/div, len(blocks)/div))
-
-			select {
-			case <-t.C:
-			case <-ctx.Done():
-				return
+		err := func() error {
+			for {
+				select {
+				case <-ticker.C:
+					clearScreen()
+					fmt.Printf(updateGauge(blocksToCheck/div, blocksToCheck/div, len(blocks)/div))
+				case <-ctx.Done():
+					return ctx.Err()
+				}
 			}
+		}()
+		if err != nil {
+			log.Error(err)
 		}
 	}()
-	for h := startHeight; h < startHeight+int64(blocksToCheck); h++ {
-		wg.Add(1)
-		go func(height int64) {
-			defer wg.Done()
-			sem <- struct{}{}
-			defer func() { <-sem }()
 
-			url := addPrefix(fmt.Sprintf("%s/block?height=%d", host, height))
-			res, err := client.Get(url)
+	lastHeight := startHeight + int64(blocksToCheck)
+
+	validators, err := getValidatorSet(client, ctx, host, startHeight)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	// Process blocks concurrently
+	for height := startHeight; height < lastHeight; height++ {
+
+		if _, ok := blocks[height]; !ok {
+			mu.Lock()
+			blocks[height] = make(map[string]StatusType)
+			mu.Unlock()
+		}
+
+		if err = sem.Acquire(ctx, 1); err != nil {
+			log.Printf("Failed to acquire semaphore: %v", err)
+			break
+		}
+
+		go func(h int64) {
+			defer sem.Release(1)
+
+			url := addPrefix(fmt.Sprintf("%s/block?height=%d", host, h))
+			req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 			if err != nil {
-				log.Errorf("Error fetching block %d: %v", height, err)
+				log.Errorf("Error creating request for block %d: %v", h, err)
+				return
+			}
+
+			var res *http.Response
+			maxRetries := 5
+			for attempt := 0; attempt < maxRetries; attempt++ {
+				res, err = client.Do(req)
+				if err == nil {
+					break
+				}
+				log.Errorf("Error fetching block %d (attempt %d/%d): %v", h, attempt+1, maxRetries, err)
+				time.Sleep(1 * time.Second)
+			}
+			if err != nil {
+				log.Errorf("Failed to fetch block %d after %d attempts: %v", h, maxRetries, err)
 				return
 			}
 			defer res.Body.Close()
+
 			body, err := io.ReadAll(res.Body)
 			if err != nil {
-				log.Errorf("Error reading block %d: %v", height, err)
+				log.Errorf("Error reading block %d: %v", h, err)
 				return
 			}
+
 			var rb CometBFTBlockResult
 			if err := json.Unmarshal(body, &rb); err != nil {
-				log.Errorf("Error unmarshaling block %d: %v", height, err)
+				log.Errorf("Error unmarshaling block %d: %v", h, err)
 				return
 			}
 
 			var status StatusType
-			if rb.Result.Block == nil || rb.Result.Block.Header == nil || rb.Result.Block.LastCommit == nil {
-				log.Errorf("Error unmarshaling block %d: %s", height, string(body))
-				status = StatusUnkown
-			} else if rb.Result.Block.Header.ProposerAddress == targetValidator {
-				status = StatusProposed
-			} else {
-				found := false
-				for _, sig := range rb.Result.Block.LastCommit.Signatures {
-					if sig.ValidatorAddress == targetValidator {
-						found = true
-						break
-					}
+			for i := 0; i < len(validators); i++ {
+				status = determineStatus(rb, validators[i], h, body)
+				mu.Lock()
+				st := stats[validators[i]]
+				switch status {
+				case StatusProposed:
+					st.proposed++
+				case StatusSigned:
+					st.signed++
+				case StatusMissed:
+					st.missed++
+				case StatusUnknown:
+					st.unknown++
 				}
-				if found {
-					status = StatusSigned
-				} else {
-					status = Statusmissed
-				}
-			}
-			mtx.Lock()
-			switch status {
-			case StatusProposed:
-				stats.proposed++
-				blocks[height] = StatusProposed
-			case StatusSigned:
-				stats.signed++
-				blocks[height] = StatusSigned
-			case Statusmissed:
-				stats.missed++
-				blocks[height] = Statusmissed
-			case StatusUnkown:
-				stats.unknown++
-				blocks[height] = StatusUnkown
+				stats[validators[i]] = st
+				blocks[h][validators[i]] = status
+				mu.Unlock()
 			}
 
-			mtx.Unlock()
-		}(h)
+			log.Debugf("completed block %d", h)
+			return
+		}(height)
 	}
 
-	wg.Wait()
-	var rawRes = fmt.Sprintf("0: Proposed, 1: Signed, 2: Missed, 3: Unknown\n")
+	// Acquire all of the tokens to wait for any remaining workers to finish.
+	//
+	// If you are already waiting for the workers by some other means (such as an
+	// errgroup.Group), you can omit this final Acquire call.
+	if err = sem.Acquire(ctx, int64(semSize)); err != nil {
+		log.Printf("Failed to acquire semaphore: %v", err)
+	} else {
+		log.Infof("complete to fetch data. processing...")
+	}
+
+	// Build raw result using strings.Builder
+	file, err := os.Create(filename)
+	if err != nil {
+		log.Fatalf("Cannot create output file: %v", err)
+	}
+	defer file.Close()
+
+	w := bufio.NewWriter(file)
+	if _, err = w.WriteString(
+		"0: Proposed, 1: Signed, 2: Missed, 3: Unknown\n\n"); err != nil {
+		log.Fatalf("Cannot write output file: %v", err)
+	}
+
+	if _, err = w.WriteString(
+		fmt.Sprintf("| %10s |", "Height")); err != nil {
+		log.Fatalf("Cannot write output file: %v", err)
+	}
+	for vIdx := 0; vIdx < len(validators); vIdx++ {
+		if _, err = w.WriteString(
+			fmt.Sprintf("| %40s |", validators[vIdx])); err != nil {
+			log.Fatalf("Cannot write output file: %v", err)
+		}
+	}
+
+	if _, err = w.WriteString("\n"); err != nil {
+		log.Fatalf("Cannot write output file: %v", err)
+	}
+
+	const chunkSize = 10000
+
 	for i := startHeight; i < startHeight+int64(blocksToCheck); i++ {
-		rawRes = rawRes + fmt.Sprintf("%d: %d\n", i, blocks[i])
+		if _, err = w.WriteString(
+			fmt.Sprintf("| %10d |", i)); err != nil {
+			log.Fatalf("Cannot write output file: %v", err)
+		}
+		for vIdx := 0; vIdx < len(validators); vIdx++ {
+			status, ok := blocks[i][validators[vIdx]]
+			if !ok {
+				status = StatusUnknown
+			}
+			if _, err = w.WriteString(fmt.Sprintf("| %40d |", status)); err != nil {
+				return "", fmt.Errorf("failed to record at block %d: %w", i, err)
+			}
+
+			if (i-startHeight+1)%chunkSize == 0 {
+				if err = w.Flush(); err != nil {
+					return "", fmt.Errorf("failed to flush chunk: %w", err)
+				}
+			}
+		}
+
+		if _, err = w.WriteString(fmt.Sprintf("\n")); err != nil {
+			return "", fmt.Errorf("failed to record at block %d: %w", i, err)
+		}
 	}
+
+	if _, err = w.WriteString(fmt.Sprintf("==================== %10s ====================\n", "Result")); err != nil {
+		log.Errorf("failed to write results: %v", err)
+	}
+
+	var rank []string
+	for key := range stats {
+		rank = append(rank, key)
+	}
+
+	sort.Slice(rank, func(i, j int) bool {
+		si, sj := stats[rank[i]], stats[rank[j]]
+		if si.missed == sj.missed {
+			return si.proposed > sj.proposed
+		}
+		return si.missed < sj.missed
+	})
+
+	for _, valAddr := range rank {
+		if _, err = w.WriteString(fmt.Sprintf("%s: Proposed: %d, Signed: %d, Missed: %d, Unknown: %d\n", valAddr, stats[valAddr].proposed, stats[valAddr].signed, stats[valAddr].missed, stats[valAddr].unknown)); err != nil {
+			log.Errorf("Failed to write signing stats %s: %v", valAddr, err)
+			continue
+		}
+	}
+
+	if err := w.Flush(); err != nil {
+		return "", fmt.Errorf("failed to flush: %w", err)
+	}
+
 	clearScreen()
-	return rawRes, fmt.Sprintf("Validator signature %s stats from block %d to %d: Proposed: %d, Signed: %d, Missed: %d, Unknown: %d",
-		targetValidator, startHeight, startHeight+int64(blocksToCheck)-1, stats.proposed, stats.signed, stats.missed, stats.unknown)
+
+	summary := fmt.Sprintf("Validator signature %s stats from block %d to %d: Proposed: %d, Signed: %d, Missed: %d, Unknown: %d",
+		targetValidator, startHeight, startHeight+int64(blocksToCheck)-1, stats[targetValidator].proposed, stats[targetValidator].signed, stats[targetValidator].missed, stats[targetValidator].unknown)
+
+	return summary, nil
 }
+
+// Example helper to determine status; refactor your current logic into this function.
+func determineStatus(rb CometBFTBlockResult, targetValidator string, height int64, body []byte) StatusType {
+	if rb.Result.Block == nil || rb.Result.Block.Header == nil || rb.Result.Block.LastCommit == nil {
+		log.Errorf("Error processing block %d: %s", height, string(body))
+		return StatusUnknown
+	}
+	if rb.Result.Block.Header.ProposerAddress == targetValidator {
+		return StatusProposed
+	}
+	for _, sig := range rb.Result.Block.LastCommit.Signatures {
+		if sig.ValidatorAddress == targetValidator {
+			return StatusSigned
+		}
+	}
+	return StatusMissed
+}
+
+func getValidatorSet(client *http.Client, ctx context.Context, host string, height int64) ([]string, error) {
+	url := addPrefix(fmt.Sprintf("%s/validators?height=%d&per_page=10000", host, height))
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return nil, errors.Wrapf(err, "Error creating request for block %d", height)
+	}
+
+	var res *http.Response
+
+	maxRetries := 5
+	for attempt := 0; attempt < maxRetries; attempt++ {
+		res, err = client.Do(req)
+		if err == nil {
+			break
+		}
+		log.Warningf("Error fetching validator at height: %d (attempt %d/%d): %v", height, attempt+1, maxRetries, err)
+		time.Sleep(1 * time.Second)
+	}
+	if err != nil {
+		return nil, errors.Wrapf(err, "Error fetching validator at height: %d", height)
+	}
+	defer res.Body.Close()
+
+	body, err := io.ReadAll(res.Body)
+	if err != nil {
+		return nil, errors.Wrapf(err, "Error reading block %d: %v", height, err)
+	}
+
+	var cometValRes CometBFTValidatorResult
+
+	if err = json.Unmarshal(body, &cometValRes); err != nil {
+		return nil, errors.Wrapf(err, "Error unmarshaling validator result %d", height)
+	}
+
+	var validators []string
+	for _, val := range cometValRes.Result.Validators {
+		validators = append(validators, val.Address)
+	}
+
+	sort.Strings(validators)
+	return validators, nil
+}
+
+type CometBFTValidatorResult struct {
+	Result  Validators `json:"result"`
+	ID      any        `json:"id"`
+	Jsonrpc string     `json:"jsonrpc"`
+}
+
+type Validators struct {
+	Total       string             `json:"total"`
+	Validators  []ValidatorElement `json:"validators"`
+	Count       string             `json:"count"`
+	BlockHeight string             `json:"block_height"`
+}
+
+type ValidatorElement struct {
+	Address          string `json:"address"`
+	ProposerPriority string `json:"proposer_priority"`
+	PubKey           PubKey `json:"pub_key"`
+	VotingPower      string `json:"voting_power"`
+}
+
+type PubKey struct {
+	Type  Type   `json:"type"`
+	Value string `json:"value"`
+}
+
+type Type string
+
+const (
+	TendermintPubKeyEd25519 Type = "tendermint/PubKeyEd25519"
+)
 
 type CometBFTStatusResult struct {
 	Result  ResultStatus `json:"result"`
@@ -399,7 +608,8 @@ func updateGauge(gaugeBlockSize, gaugeTotalSize, gaugeCurrent int) string {
 var afterClearMsg string
 
 func clearScreen() {
-	c := exec.Command("Clear")
+	// Adjust the command according to your OS if needed.
+	c := exec.Command("clear")
 	c.Stdout = os.Stdout
 	c.Run()
 
